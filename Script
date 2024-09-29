@@ -1,0 +1,98 @@
+import sys
+import boto3
+from datetime import datetime
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+import configparser
+import logging
+
+# Configurer le logger
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger()
+
+def job_execution():
+    # Obtenir les arguments
+    params = getResolvedOptions(sys.argv, ['TASK_NAME'])
+    
+    # Initialiser les contextes Glue et Spark
+    spark_ctx = SparkContext()
+    glue_ctx = GlueContext(spark_ctx)
+    spark_session = glue_ctx.spark_session
+    glue_job = Job(glue_ctx)
+    glue_job.init(params['TASK_NAME'], params)
+
+    # Extraire les configurations JDBC
+    jdbc_config = glue_ctx.extract_jdbc_conf('jdbc_custom_connection')
+    jdbc_options = {
+        "url": jdbc_config["fullurl"],
+        "user": jdbc_config["user"],
+        "password": jdbc_config["password"],
+        "encryption_level": "REQUIRED",
+        "driver": "oracle.jdbc.OracleDriver"
+    }
+
+    # Initialiser le client S3 et lire le nouveau fichier de propriétés
+    s3_service = boto3.client('s3')
+    bucket_dir = 'aws-glue-assets-custom'  # Mettre à jour le chemin vers le fichier de propriétés
+    key_file = 'scripts/custom_queries.properties'  # Mettre à jour le chemin vers le fichier de propriétés
+
+    try:
+        # Lire le fichier de propriétés depuis S3
+        s3_file = s3_service.get_object(Bucket=bucket_dir, Key=key_file)
+        properties_data = s3_file['Body'].read().decode('utf-8')
+
+        # Lire la nouvelle requête SQL depuis le fichier de propriétés
+        parser_config = configparser.ConfigParser()
+        parser_config.read_string(properties_data)
+        sql_query = parser_config.get('DEFAULT', 'custom_job_query')
+
+        # Configurer les dossiers de sortie et les noms de fichiers
+        current_day = datetime.now().strftime("%Y_%m_%d")
+        time_stamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+        output_dir = "output/data"
+        trace_dir = "logs"
+        output_file_name = f"{current_day}_{time_stamp}_data.csv"
+        s3_bucket = "custom-csv-bucket"
+
+        try:
+            # Exécuter la requête et écrire les données dans S3
+            dataframe = spark_session.read.jdbc(url=jdbc_options['url'], table=f"({sql_query})", properties=jdbc_options)
+            if dataframe.count() > 0:
+                log.info(f"Rows: {dataframe.count()} - Inserting data into S3")
+                selected_data = dataframe.select('*')
+                
+                # Écrire le dataframe dans un répertoire temporaire sur S3
+                temp_output = f"s3://{s3_bucket}/{output_dir}/temp_{output_file_name}"
+                selected_data.coalesce(1).write.mode("overwrite").option("delimiter", ";").csv(temp_output, header=True)
+
+                # Utiliser boto3 pour renommer le fichier
+                s3_resource = boto3.resource('s3')
+                s3_bucket_obj = s3_resource.Bucket(s3_bucket)
+
+                # Trouver le fichier de partie dans le répertoire temporaire
+                csv_part_file = None
+                for obj in s3_bucket_obj.objects.filter(Prefix=f"{output_dir}/temp_{output_file_name}/"):
+                    if obj.key.endswith('.csv'):
+                        csv_part_file = obj.key
+                        break
+
+                if csv_part_file:
+                    # Copier le fichier part vers la destination finale avec le nom de fichier souhaité
+                    copy_source = {'Bucket': s3_bucket, 'Key': csv_part_file}
+                    final_output = f"{output_dir}/{output_file_name}"
+                    s3_bucket_obj.copy(copy_source, final_output)
+                    log.info(f"File {csv_part_file} written to S3://{s3_bucket}/{final_output}")
+
+                    # Supprimer les fichiers temporaires
+                    s3_bucket_obj.objects.filter(Prefix=f"{output_dir}/temp_{output_file_name}/").delete()
+                else:
+                    log.error("Part file not found in temporary directory")
+            else:
+                log.info("No data found in DataFrame")
+        except Exception as ex:
+            log.error(f"Error executing job: {ex}", exc_info=True)
+    finally:
+        glue_job.commit()
+
